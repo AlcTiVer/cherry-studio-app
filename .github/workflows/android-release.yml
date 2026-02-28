@@ -36,13 +36,37 @@ jobs:
         with:
           version: 10.26.2
 
-      # Step 4: Setup Expo and EAS
-      - name: Setup Expo and EAS
-        uses: expo/expo-github-action@v8
+      # 1. 设置 Java 环境（编译 Android 必须）
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
-          packager: pnpm
+          distribution: 'zulu'
+          java-version: '17'
+
+      # 2. 安装依赖 (确保使用的是 pnpm)
+      - name: Install dependencies
+        run: pnpm install
+
+      # 3. 生成 Android 原生工程 (Expo Prebuild)
+      # 这一步会将 Expo 代码转成标准的 Android Studio 工程
+      - name: Expo Prebuild
+        run: npx expo prebuild --platform android
+
+      # 4. 使用 Gradle 直接编译 APK
+      - name: Build APK with Gradle
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace
+
+      # 5. 上传生成的 APK 产物
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cherry-Studio-Fixed-APK
+          # 这是 Gradle 编译后 APK 的默认存放路径
+          path: android/app/build/outputs/apk/release/app-release.apk
+
 
       # Step 5: Install dependencies
       - name: Install dependencies
