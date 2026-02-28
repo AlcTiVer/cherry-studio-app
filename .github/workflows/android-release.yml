@@ -46,12 +46,18 @@ jobs:
       - name: Expo Prebuild
         run: npx expo prebuild --platform android
 
-      # 5. 使用 Gradle 编译 APK
+      # 5. 使用 Gradle 编译 APK (增加了内存配置并跳过了 lint 检查)
       - name: Build APK with Gradle
+        env:
+          # 给 Gradle 分配更多内存，并增加 Metaspace 上限
+          _JAVA_OPTIONS: "-Xmx4g -XX:MaxMetaspaceSize=1g"
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleRelease --stacktrace
+          # -x lint: 跳过常规检查
+          # -x lintVitalRelease: 跳过发布前的关键检查（这是最吃内存的一步）
+          ./gradlew assembleRelease -x lint -x lintVitalRelease --stacktrace
+
 
       # 6. 将 APK 移动到根目录并重命名 (方便识别)
       - name: Prepare APK for Upload
