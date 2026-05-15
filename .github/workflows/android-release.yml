@@ -1,86 +1,220 @@
-name: Android Release (Custom Build)
+name: Android Build (Local Gradle)
 
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Release tag'
+      build_type:
+        description: '构建类型'
         required: true
-        default: 'v1.0.0-custom'
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+  push:
+    tags:
+      - 'v*.*.*'
 
 jobs:
   build-android:
     name: Build Android APK
     runs-on: ubuntu-latest
-
+    
     steps:
-      # 1. 拉取指定代码 (使用了你提供的 Commit ID)
+      # ── 1. 检出代码 ──────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
-        with: 
-          repository: CherryHQ/cherry-studio-app
-          ref: 45306bcb868f56f1159152fe7feda8404ef1cead
 
-      # 2. 设置环境
+      # ── 2. 配置 Node.js ──────────────────────────────────────
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20.x
+          node-version: '20.x'
+          cache: 'npm'
 
+      # ── 3. 安装 pnpm ─────────────────────────────────────────
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10.26.2
 
+      # ── 4. 配置 pnpm 缓存 ────────────────────────────────────
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        run: echo "store=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm modules
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.store }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      # ── 5. 安装 JS 依赖 ──────────────────────────────────────
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── 6. 配置 Java 17（Android 构建需要）───────────────────
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
+          distribution: 'temurin'
           java-version: '17'
 
-      # 3. 安装依赖
-      - name: Install dependencies
-        run: pnpm install
+      # ── 7. 配置 Android SDK ──────────────────────────────────
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-      # 4. Expo 预构建 (生成 android 目录)
-      - name: Expo Prebuild
-        run: npx expo prebuild --platform android
+      # ── 8. 缓存 Gradle ───────────────────────────────────────
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
 
-      # 5. 使用 Gradle 编译 APK (同时给 Java 和 Node 增加内存，并跳过代码检查)
-      - name: Build APK with Gradle
-        env:
-          # 给 Java 虚拟机的内存
-          _JAVA_OPTIONS: "-Xmx4g -XX:MaxMetaspaceSize=1g"
-          # 给 Node.js (Metro 打包器) 的内存，防止 JS 堆内存溢出
-          NODE_OPTIONS: "--max-old-space-size=4096"
+      # ── 9. 获取版本号 ────────────────────────────────────────
+      - name: Get version tag
+        id: version
         run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # 手动触发时从 package.json 读取版本
+            VERSION=$(node -p "require('./package.json').version")
+            echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "tag=${TAG}" >> $GITHUB_OUTPUT
+            echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          fi
+          echo "build_type=${{ github.event.inputs.build_type || 'release' }}" >> $GITHUB_OUTPUT
+
+      # ── 10. 生成签名密钥（如果没有配置 Secrets 则跳过签名）──
+      - name: Setup signing config
+        id: signing
+        run: |
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "has_keystore=true" >> $GITHUB_OUTPUT
+            # 解码 keystore
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
+            echo "✅ Keystore configured"
+          else
+            echo "has_keystore=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No keystore found, will build unsigned APK"
+          fi
+
+      # ── 11. 配置 Gradle 签名属性 ─────────────────────────────
+      - name: Configure Gradle signing properties
+        if: steps.signing.outputs.has_keystore == 'true'
+        run: |
+          cat >> android/gradle.properties << EOF
+          MYAPP_RELEASE_STORE_FILE=release.keystore
+          MYAPP_RELEASE_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}
+          MYAPP_RELEASE_STORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          MYAPP_RELEASE_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+          echo "✅ Signing properties configured"
+
+      # ── 12. 给 gradlew 添加执行权限 ──────────────────────────
+      - name: Grant Gradle execute permission
+        run: chmod +x android/gradlew
+
+      # ── 13. 执行构建 ─────────────────────────────────────────
+      - name: Build Android APK
+        run: |
+          BUILD_TYPE="${{ steps.version.outputs.build_type }}"
           cd android
-          chmod +x gradlew
-          # 使用 assembleRelease 生产包
-          # 如果这个步骤还是失败，可以尝试把 assembleRelease 改成 assembleDebug (更容易成功)
-          ./gradlew assembleRelease -x lint -x lintVitalRelease --stacktrace
+          
+          if [ "$BUILD_TYPE" == "debug" ]; then
+            echo "🔨 Building Debug APK..."
+            ./gradlew assembleDebug \
+              --no-daemon \
+              --stacktrace \
+              -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
+          else
+            echo "🔨 Building Release APK..."
+            ./gradlew assembleRelease \
+              --no-daemon \
+              --stacktrace \
+              -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
+          fi
 
-
-
-      # 6. 将 APK 移动到根目录并重命名 (方便识别)
-      - name: Prepare APK for Upload
+      # ── 14. 定位并重命名 APK ─────────────────────────────────
+      - name: Locate and rename APK
+        id: apk
         run: |
-          mv android/app/build/outputs/apk/release/app-release.apk ./CherryStudio-Fixed.apk
+          BUILD_TYPE="${{ steps.version.outputs.build_type }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          
+          if [ "$BUILD_TYPE" == "debug" ]; then
+            APK_PATH=$(find android/app/build/outputs/apk/debug -name "*.apk" | head -1)
+          else
+            APK_PATH=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          fi
+          
+          if [ -z "$APK_PATH" ]; then
+            echo "❌ APK not found!"
+            find android/app/build/outputs -name "*.apk" 2>/dev/null || true
+            exit 1
+          fi
+          
+          # 重命名为带版本号的文件名
+          APK_NAME="CherryStudio-${TAG}-${BUILD_TYPE}.apk"
+          cp "$APK_PATH" "$APK_NAME"
+          
+          echo "apk_path=${APK_NAME}" >> $GITHUB_OUTPUT
+          echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
+          echo "✅ APK ready: $APK_NAME ($(du -h $APK_NAME | cut -f1))"
 
-      # 7. 上传到 GitHub Actions Artifacts (最稳妥的获取方式)
-      - name: Upload Artifact
+      # ── 15. 上传 APK 为 Artifact（无论是否发布 Release）──────
+      - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Cherry-Studio-Fixed-APK
-          path: CherryStudio-Fixed.apk
+          name: ${{ steps.apk.outputs.apk_name }}
+          path: ${{ steps.apk.outputs.apk_path }}
+          retention-days: 30
 
-      # 8. 创建 GitHub Release (可选，如果你想在 Release 页面看到它)
+      # ── 16. 创建 GitHub Release（仅 tag 触发或手动 release）──
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag }}
-          name: Cherry Studio Custom Fix
-          files: CherryStudio-Fixed.apk
-          draft: true  # 先设为草稿，你可以手动发布
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Cherry Studio ${{ steps.version.outputs.tag }}
+          body: |
+            ## Cherry Studio ${{ steps.version.outputs.tag }}
+
+            ### 🤖 Android
+            - **构建类型**: `${{ steps.version.outputs.build_type }}`
+            - **构建方式**: 本地 Gradle 构建
+            - **签名状态**: ${{ steps.signing.outputs.has_keystore == 'true' && '✅ 已签名' || '⚠️ 未签名（调试用）' }}
+
+            ### 📥 安装说明
+            1. 下载下方的 APK 文件
+            2. 在 Android 设备上允许"未知来源"安装
+            3. 安装 APK
+
+            ---
+            🤖 由 GitHub Actions 自动构建
+          files: ${{ steps.apk.outputs.apk_path }}
+          draft: false
+          prerelease: ${{ steps.version.outputs.build_type == 'debug' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 17. 构建摘要 ─────────────────────────────────────────
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "## 🤖 Android 构建结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 版本 | \`${{ steps.version.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 构建类型 | \`${{ steps.version.outputs.build_type }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 签名 | ${{ steps.signing.outputs.has_keystore == 'true' && '✅ 已签名' || '⚠️ 未签名' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| APK | \`${{ steps.apk.outputs.apk_name }}\` |" >> $GITHUB_STEP_SUMMARY
