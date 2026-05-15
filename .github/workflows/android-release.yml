@@ -19,54 +19,41 @@ jobs:
   build-android:
     name: Build Android APK
     runs-on: ubuntu-latest
-    
+
     steps:
       # ── 1. 检出代码 ──────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. 配置 Node.js ──────────────────────────────────────
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20.x'
-          cache: 'npm'
-
-      # ── 3. 安装 pnpm ─────────────────────────────────────────
+      # ── 2. 先安装 pnpm（必须在 setup-node 之前）─────────────
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10.26.2
 
-      # ── 4. 配置 pnpm 缓存 ────────────────────────────────────
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        run: echo "store=$(pnpm store path)" >> $GITHUB_OUTPUT
-
-      - name: Cache pnpm modules
-        uses: actions/cache@v4
+      # ── 3. 配置 Node.js（pnpm 已存在，cache 可正确识别）─────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          path: ${{ steps.pnpm-cache.outputs.store }}
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-
+          node-version: '20.x'
+          cache: 'pnpm'
 
-      # ── 5. 安装 JS 依赖 ──────────────────────────────────────
+      # ── 4. 安装 JS 依赖 ──────────────────────────────────────
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # ── 6. 配置 Java 17（Android 构建需要）───────────────────
+      # ── 5. 配置 Java 17 ──────────────────────────────────────
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # ── 7. 配置 Android SDK ──────────────────────────────────
+      # ── 6. 配置 Android SDK ──────────────────────────────────
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      # ── 8. 缓存 Gradle ───────────────────────────────────────
+      # ── 7. 缓存 Gradle ───────────────────────────────────────
       - name: Cache Gradle packages
         uses: actions/cache@v4
         with:
@@ -77,12 +64,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # ── 9. 获取版本号 ────────────────────────────────────────
+      # ── 8. 获取版本号 ────────────────────────────────────────
       - name: Get version tag
         id: version
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # 手动触发时从 package.json 读取版本
             VERSION=$(node -p "require('./package.json').version")
             echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
             echo "version=${VERSION}" >> $GITHUB_OUTPUT
@@ -93,13 +79,12 @@ jobs:
           fi
           echo "build_type=${{ github.event.inputs.build_type || 'release' }}" >> $GITHUB_OUTPUT
 
-      # ── 10. 生成签名密钥（如果没有配置 Secrets 则跳过签名）──
+      # ── 9. 配置签名 ──────────────────────────────────────────
       - name: Setup signing config
         id: signing
         run: |
           if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
             echo "has_keystore=true" >> $GITHUB_OUTPUT
-            # 解码 keystore
             echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
             echo "✅ Keystore configured"
           else
@@ -107,7 +92,7 @@ jobs:
             echo "⚠️ No keystore found, will build unsigned APK"
           fi
 
-      # ── 11. 配置 Gradle 签名属性 ─────────────────────────────
+      # ── 10. 写入 Gradle 签名属性 ─────────────────────────────
       - name: Configure Gradle signing properties
         if: steps.signing.outputs.has_keystore == 'true'
         run: |
@@ -117,18 +102,17 @@ jobs:
           MYAPP_RELEASE_STORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           MYAPP_RELEASE_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}
           EOF
-          echo "✅ Signing properties configured"
 
-      # ── 12. 给 gradlew 添加执行权限 ──────────────────────────
+      # ── 11. 给 gradlew 添加执行权限 ──────────────────────────
       - name: Grant Gradle execute permission
         run: chmod +x android/gradlew
 
-      # ── 13. 执行构建 ─────────────────────────────────────────
+      # ── 12. 执行 Gradle 构建 ─────────────────────────────────
       - name: Build Android APK
         run: |
           BUILD_TYPE="${{ steps.version.outputs.build_type }}"
           cd android
-          
+
           if [ "$BUILD_TYPE" == "debug" ]; then
             echo "🔨 Building Debug APK..."
             ./gradlew assembleDebug \
@@ -143,34 +127,33 @@ jobs:
               -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
           fi
 
-      # ── 14. 定位并重命名 APK ─────────────────────────────────
+      # ── 13. 定位并重命名 APK ─────────────────────────────────
       - name: Locate and rename APK
         id: apk
         run: |
           BUILD_TYPE="${{ steps.version.outputs.build_type }}"
           TAG="${{ steps.version.outputs.tag }}"
-          
+
           if [ "$BUILD_TYPE" == "debug" ]; then
             APK_PATH=$(find android/app/build/outputs/apk/debug -name "*.apk" | head -1)
           else
             APK_PATH=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
           fi
-          
+
           if [ -z "$APK_PATH" ]; then
             echo "❌ APK not found!"
             find android/app/build/outputs -name "*.apk" 2>/dev/null || true
             exit 1
           fi
-          
-          # 重命名为带版本号的文件名
+
           APK_NAME="CherryStudio-${TAG}-${BUILD_TYPE}.apk"
           cp "$APK_PATH" "$APK_NAME"
-          
+
           echo "apk_path=${APK_NAME}" >> $GITHUB_OUTPUT
           echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
-          echo "✅ APK ready: $APK_NAME ($(du -h $APK_NAME | cut -f1))"
+          echo "✅ APK: $APK_NAME ($(du -h $APK_NAME | cut -f1))"
 
-      # ── 15. 上传 APK 为 Artifact（无论是否发布 Release）──────
+      # ── 14. 上传为 Artifact ──────────────────────────────────
       - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -178,7 +161,7 @@ jobs:
           path: ${{ steps.apk.outputs.apk_path }}
           retention-days: 30
 
-      # ── 16. 创建 GitHub Release（仅 tag 触发或手动 release）──
+      # ── 15. 创建 GitHub Release ──────────────────────────────
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
@@ -191,12 +174,7 @@ jobs:
             ### 🤖 Android
             - **构建类型**: `${{ steps.version.outputs.build_type }}`
             - **构建方式**: 本地 Gradle 构建
-            - **签名状态**: ${{ steps.signing.outputs.has_keystore == 'true' && '✅ 已签名' || '⚠️ 未签名（调试用）' }}
-
-            ### 📥 安装说明
-            1. 下载下方的 APK 文件
-            2. 在 Android 设备上允许"未知来源"安装
-            3. 安装 APK
+            - **签名状态**: ${{ steps.signing.outputs.has_keystore == 'true' && '✅ 已签名' || '⚠️ 未签名' }}
 
             ---
             🤖 由 GitHub Actions 自动构建
@@ -206,15 +184,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 17. 构建摘要 ─────────────────────────────────────────
+      # ── 16. 构建摘要 ─────────────────────────────────────────
       - name: Build Summary
         if: always()
         run: |
-          echo "## 🤖 Android 构建结果" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🤖 构建结果" >> $GITHUB_STEP_SUMMARY
           echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
           echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
           echo "| 版本 | \`${{ steps.version.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| 构建类型 | \`${{ steps.version.outputs.build_type }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 类型 | \`${{ steps.version.outputs.build_type }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| 签名 | ${{ steps.signing.outputs.has_keystore == 'true' && '✅ 已签名' || '⚠️ 未签名' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| APK | \`${{ steps.apk.outputs.apk_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| APK  | \`${{ steps.apk.outputs.apk_name }}\` |" >> $GITHUB_STEP_SUMMARY
